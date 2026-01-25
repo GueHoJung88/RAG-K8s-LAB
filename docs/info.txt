@@ -1,0 +1,104 @@
+## database
+Host: postgres.genai.svc.cluster.local (또는 그냥 postgres)
+Port: 5432
+DB: ragdb
+User: raguser
+Password: ragpassword
+
+## k8s 명령어 (핵심 kubectl)
+
+# Namespace
+kubectl create namespace genai
+kubectl get namespaces
+kubectl delete namespace genai
+
+# Create/Apply (YAML 설정 적용)
+kubectl apply -n genai -f k8s/00-namespace.yaml
+kubectl apply -n genai -f k8s/10-postgres-pgvector.yaml
+kubectl apply -n genai -f k8s/20-rag-api.yaml
+kubectl delete -n genai -f k8s/20-rag-api.yaml
+
+# Get (리소스 조회)
+kubectl get pods -n genai
+kubectl get pods -n genai -w  # Watch (실시간 모니터링)
+kubectl get deployments -n genai
+kubectl get services -n genai
+kubectl get all -n genai
+
+# Describe (리소스 상세 정보)
+kubectl describe pod <pod-name> -n genai
+kubectl describe deployment rag-api -n genai
+kubectl describe service postgres -n genai
+
+# Logs (로그 조회)
+kubectl logs -n genai deploy/rag-api --tail=10
+kubectl logs -n genai deploy/rag-api -f  # Follow (실시간 로그)
+kubectl logs -n genai pod/<pod-name> --previous  # 이전 Pod 로그
+
+# Rollout (배포 재시작/상태 확인)
+kubectl rollout restart -n genai deploy/rag-api
+kubectl rollout status -n genai deploy/rag-api
+kubectl rollout history -n genai deploy/rag-api
+
+# Port-forward (로컬에서 액세스)
+kubectl port-forward -n genai svc/postgres 5432:5432
+kubectl port-forward -n genai svc/rag-api 8000:8000
+
+# Exec (Pod 내 명령 실행)
+kubectl exec -it <pod-name> -n genai -- bash
+kubectl exec -it <pod-name> -n genai -- sh
+
+# Scale (Replica 수 조정)
+kubectl scale -n genai deploy/rag-api --replicas=2
+
+# Edit (리소스 온라인 편집)
+kubectl edit deployment rag-api -n genai
+
+## 로컬에서 실행시 k8s port-forwar + localhost
+POSTBRES_DB : kubectl port-forward -n genai svc/postgres 5432:5432
+APP_SERVER  : kubectl port-forward -n genai svc/rag-api 8000:8000
+
+## yaml 파일 설정 변경 및 적용/재시작
+kubectl apply -n genai -f k8s/20-rag-api.yaml
+kubectl rollout restart -n genai deploy/rag-api
+
+## 이미지 재빌드 → kind 로드 → 배포
+cd ~/Documents/AI_FT_RAG/dev/genai-k8s-lab
+docker build -t rag-api:0.3 -f app/Dockerfile .
+kind load docker-image rag-api:0.3 --name genai
+kubectl apply -n genai -f k8s/20-rag-api.yaml
+
+## k8s/20-rag-api.yaml의 image를:
+
+image: rag-api:0.3
+imagePullPolicy: IfNotPresent
+
+
+## 적용:
+
+kubectl apply -n genai -f k8s/20-rag-api.yaml
+kubectl rollout restart -n genai deploy/rag-api
+kubectl get pods -n genai
+kubectl logs -n genai deploy/rag-api --tail=100
+
+## local .env 
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=ragdb
+DB_USER=raguser
+DB_PASSWORD=ragpassword
+
+## Ollama 명령어
+sudo systemctl stop ollama
+sudo systemctl edit ollama
+sudo systemctl daemon-reload
+sudo systemctl start ollama
+sudo systemctl status ollama --no-pager
+
+## k8s postgres 접속 with psql-client Pod
+kubectl run -it --rm psql-client \
+  -n genai \
+  --image=postgres:15 \
+  --env="PGPASSWORD=ragpassword" \
+  -- bash
+psql -h postgres -U raguser -d ragdb

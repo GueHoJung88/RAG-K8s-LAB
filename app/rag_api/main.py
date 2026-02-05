@@ -33,6 +33,19 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "ragpassword")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
+# -------------------------
+# Ollama tuning knobs (env-based)
+# -------------------------
+# START: ollama_tuning_settings
+OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "120"))   # read timeout
+OLLAMA_CONNECT_TIMEOUT_SEC = int(os.getenv("OLLAMA_CONNECT_TIMEOUT_SEC", "5"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))   # max tokens to generate
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
+OLLAMA_REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1"))
+EVIDENCE_SNIPPET_CHARS = int(os.getenv("EVIDENCE_SNIPPET_CHARS", "450"))
+# END: ollama_tuning_settings
+
 # Retrieval params
 TOP_K = int(os.getenv("TOP_K", "4"))
 
@@ -86,7 +99,6 @@ class FeedbackRequest(BaseModel):
     comment: Optional[str] = None
 
 
-
 # -------------------------
 # DB helpers
 # -------------------------
@@ -107,33 +119,6 @@ def ensure_vector_extension():
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             conn.commit()
-
-
-def fetch_topk_chunks(question: str, doc_group: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    MVP 단계에서는 'embedding 기반 벡터 검색'을 구현하기 전,
-    DB에 미리 들어가 있는 chunk가 있다고 가정하고 "최근 chunk"를 top-k로 뽑는 스텁 형태입니다.
-
-    다음 단계(Step 7~)에서:
-      - sentence-transformers로 query embedding 생성
-      - pgvector <-> 연산으로 top-k 유사도 검색
-    로 교체합니다.
-    """
-    sql = """
-        SELECT
-          doc_title, doc_group, section, page,
-          content,
-          0.5::float as score
-        FROM rag_chunks
-        WHERE (%s IS NULL OR doc_group = %s)
-        ORDER BY created_at DESC
-        LIMIT %s
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (doc_group, doc_group, TOP_K))
-            rows = cur.fetchall()
-            return rows
 
 
 def insert_query_log(
@@ -237,7 +222,9 @@ def call_ollama(question: str, evidences: List[Dict[str, Any]]) -> str:
     evidence_texts = []
     for i, ev in enumerate(evidences, start=1):
         meta = f"[{i}] {ev.get('doc_title')} | group={ev.get('doc_group')} | section={ev.get('section')} | page={ev.get('page')}"
-        snippet = (ev.get("content") or "")[:800]
+        # START: evidence_truncate
+        snippet = (ev.get("content") or "")[:EVIDENCE_SNIPPET_CHARS]
+        # END: evidence_truncate
         evidence_texts.append(f"{meta}\n{snippet}")
 
     prompt = f"""너는 개인정보보호 관련 문서를 근거로 답변하는 어시스턴트다.
@@ -262,10 +249,23 @@ def call_ollama(question: str, evidences: List[Dict[str, Any]]) -> str:
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        # START: ollama_options
+        "options": {
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": OLLAMA_TEMPERATURE,
+            "top_p": OLLAMA_TOP_P,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+        },
+        # END: ollama_options
     }
 
     try:
-        r = requests.post(url, json=payload, timeout=120)
+        r = requests.post(
+            url,
+            json=payload,
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SEC, OLLAMA_TIMEOUT_SEC),
+        )  # START: ollama_timeout_tuple
+        # END: ollama_timeout_tuple
         r.raise_for_status()
         data = r.json()
         return data.get("response", "").strip()
@@ -397,7 +397,6 @@ def query(req: QueryRequest):
     return QueryResponse(query_log_id=query_log_id, answer=answer, evidences=evidences)
 
 
-
 @app.get("/metrics")
 def metrics():
     start = time.time()
@@ -407,7 +406,6 @@ def metrics():
         return Response(content=data, media_type=CONTENT_TYPE_LATEST)
     finally:
         REQ_LAT.labels(endpoint="/metrics").observe(time.time() - start)
-
 
 
 @app.post("/feedback")
@@ -425,4 +423,3 @@ def feedback(req: FeedbackRequest):
             )
             conn.commit()
     return {"status": "ok", "feedback_id": fb_id}
-

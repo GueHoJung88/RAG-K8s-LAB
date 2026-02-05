@@ -1,0 +1,7 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: /home/addinedu/Documents/AI_FT_RAG/dev/genai-k8s-lab/data/raw_docs
+        containerPath: /data/raw_docs

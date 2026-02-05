@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: rag-api
-          image: rag-api:0.4
+          image: rag-api:0.7
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -32,15 +32,24 @@ spec:
               value: "ragpassword"
 
             - name: OLLAMA_BASE_URL
-              # value: "http://192.168.0.46:11434"
-              value: "http://192.168.0.10:11434"
+              value: "http://192.168.0.46:11434"
+              # value: "http://192.168.0.10:11434"
             - name: OLLAMA_MODEL
               value: "llama3.2:3b"
 
+            - name: DOC_ROOT
+              value: "/data/raw_docs"
             - name: TOP_K
               value: "4"
             - name: EMBED_MODEL_NAME
               value: "sentence-transformers/all-MiniLM-L6-v2"
+          
+          # ✅ (2) volumeMounts는 컨테이너 내부에 추가
+          volumeMounts:
+            - name: rag-docs
+              mountPath: /data/raw_docs
+              readOnly: true
+
           resources:
             requests:
               memory: "512Mi"
@@ -48,6 +57,13 @@ spec:
             limits:
               memory: "2Gi"
               cpu: "1"
+
+      # ✅ (3) volumes는 containers 바깥(template.spec 레벨)에 추가
+      volumes:
+        - name: rag-docs
+          hostPath:
+            path: /data/raw_docs
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
@@ -58,6 +74,7 @@ spec:
   selector:
     app: rag-api
   ports:
-    - port: 8000
+    - name: http          # ✅ ServiceMonitor 쓸 거면 name: http 추천
+      port: 8000
       targetPort: 8000
   type: ClusterIP

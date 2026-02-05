@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
 
-from rag import retrieve
+from rag import retrieve, ingest_pdfs_to_db
 
 
 # Load environment variables from .env file
@@ -72,7 +72,10 @@ class QueryResponse(BaseModel):
 class IngestRequest(BaseModel):
     # 이번 단계에서는 실제 PDF ingest 파이프라인을 아직 넣지 않고 "연결 테스트"를 위한 스텁을 제공합니다.
     # 다음 단계에서: PDF 파싱 → chunk → embedding → insert 로 확장합니다.
-    ping: Optional[bool] = True
+    doc_group: str = "guide"
+    limit: Optional[int] = None
+    chunk_size: int = 1000
+    overlap: int = 150
 
 
 class FeedbackRequest(BaseModel):
@@ -139,45 +142,68 @@ def insert_query_log(
     doc_group: Optional[str],
     top_k: int,
     retrieved_meta: List[Dict[str, Any]],
-    model_name: str,
+    embed_model_name: str,
+    llm_model: str,
     prompt_version: str,
     answer: str,
-    t_retrieval_ms: int,
-    t_generate_ms: int,
-    t_total_ms: int,
+    latency_ms: int,
+    error: Optional[str] = None,
 ):
-    # score 요약
+    """
+    rag_query_log 스키마(우리가 생성한 버전)에 맞춰 INSERT.
+    - evidences: jsonb 로 저장 (retrieved_meta 사용)
+    - retrieval_*: 점수 요약
+    - citation_coverage: [1][2] 같은 인용 번호 포함 수 (간단 버전)
+    - context_overlap: 지금은 MVP로 0.0 (다음 단계에서 계산)
+    """
     scores = [float(x.get("score", 0.0)) for x in retrieved_meta if x.get("score") is not None]
-    score_avg = sum(scores) / len(scores) if scores else 0.0
-    score_min = min(scores) if scores else 0.0
+    score_avg = (sum(scores) / len(scores)) if scores else None
+    score_min = min(scores) if scores else None
+    # p95는 MVP에서는 생략/None 처리 (필요하면 numpy로 계산)
+    score_p95 = None
 
-    # citation coverage (간단 버전): 답변에 [숫자] 패턴 몇 개 포함?
     import re
     citation_coverage = len(re.findall(r"\[\d+\]", answer or ""))
 
-    sql = """
-    INSERT INTO rag_query_log (
-      id, trace_id, user_id,
-      question, doc_group, top_k,
-      retrieved_count, retrieved_meta,
-      model_name, prompt_version,
-      answer, error,
-      t_retrieval_ms, t_generate_ms, t_total_ms,
-      citation_coverage, retrieval_score_avg, retrieval_score_min
-    ) VALUES (
-      %s, %s, %s,
-      %s, %s, %s,
-      %s, %s::jsonb,
-      %s, %s,
-      %s, NULL,
-      %s, %s, %s,
-      %s, %s, %s
-    );
-    """
+    empty_retrieval = (len(retrieved_meta) == 0)
 
-    # trace/user는 오늘은 MVP라 None 처리(다음 단계에서 OIDC로 채우면 됨)
+    # trace/user는 MVP라 None (나중에 OIDC로 채움)
     trace_id = None
     user_id = None
+    user_role = None
+
+    sql = """
+    INSERT INTO rag_query_log (
+      id,
+      trace_id, user_id, user_role,
+      question, doc_group,
+      top_k,
+      embed_model_name, llm_model, prompt_version,
+      retrieval_count, retrieval_score_avg, retrieval_score_min, retrieval_score_p95,
+      empty_retrieval,
+      answer,
+      evidences,
+      latency_ms,
+      citation_coverage,
+      context_overlap,
+      error
+    )
+    VALUES (
+      %s,
+      %s, %s, %s,
+      %s, %s,
+      %s,
+      %s, %s, %s,
+      %s, %s, %s, %s,
+      %s,
+      %s,
+      %s::jsonb,
+      %s,
+      %s,
+      %s,
+      %s
+    );
+    """
 
     import json
     with get_conn() as conn:
@@ -185,17 +211,22 @@ def insert_query_log(
             cur.execute(
                 sql,
                 (
-                    query_log_id, trace_id, user_id,
-                    question, doc_group, top_k,
-                    len(retrieved_meta), json.dumps(retrieved_meta),
-                    model_name, prompt_version,
+                    query_log_id,
+                    trace_id, user_id, user_role,
+                    question, doc_group,
+                    top_k,
+                    embed_model_name, llm_model, prompt_version,
+                    len(retrieved_meta), score_avg, score_min, score_p95,
+                    empty_retrieval,
                     answer,
-                    t_retrieval_ms, t_generate_ms, t_total_ms,
-                    citation_coverage, score_avg, score_min,
+                    json.dumps(retrieved_meta),
+                    latency_ms,
+                    float(citation_coverage),
+                    0.0,  # context_overlap: MVP에서는 0.0 (다음 단계에서 계산)
+                    error,
                 ),
             )
             conn.commit()
-
 
 
 # -------------------------
@@ -265,11 +296,15 @@ def ingest(req: IngestRequest):
     REQ_COUNT.labels(endpoint="/ingest").inc()
 
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                _ = cur.fetchone()
-        return {"status": "ok", "message": "DB connection OK. (Ingest pipeline will be added next.)"}
+        result = ingest_pdfs_to_db(
+            doc_group=req.doc_group,
+            limit=req.limit,
+            chunk_size=req.chunk_size,
+            overlap=req.overlap,
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ingest failed: {e}")
     finally:
         REQ_LAT.labels(endpoint="/ingest").observe(time.time() - start)
 
@@ -282,19 +317,28 @@ def query(req: QueryRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
-    # 1) Retrieve (현재는 스텁: 최신 chunk top-k)
-    # chunks = fetch_topk_chunks(req.question, req.doc_group)
-
     query_log_id = str(uuid.uuid4())
 
     # 1) Retrieve
     t_retrieval0 = time.time()
-    # 실제 embedding 기반 검색으로 교체
-    chunks = retrieve(req.question, req.doc_group) # rag.py :contentReference[oaicite:5]{index=5}
+    chunks = retrieve(req.question, req.doc_group)
     t_retrieval_ms = int((time.time() - t_retrieval0) * 1000)
 
     if not chunks:
-        # 로그도 남기고 싶다면 여기서 insert_query_log(error=...)로 확장 가능
+        # 검색 결과가 없더라도, 로그는 남기는 것이 실무적으로 유리
+        insert_query_log(
+            query_log_id=query_log_id,
+            question=req.question,
+            doc_group=req.doc_group,
+            top_k=TOP_K,
+            retrieved_meta=[],
+            embed_model_name=os.getenv("EMBED_MODEL_NAME", "unknown"),
+            llm_model=OLLAMA_MODEL,
+            prompt_version=os.getenv("PROMPT_VERSION", "v0"),
+            answer="",
+            latency_ms=int((time.time() - t0) * 1000),
+            error="empty retrieval",
+        )
         raise HTTPException(status_code=404, detail="No chunks found in DB. Ingest documents first.")
 
     for c in chunks:
@@ -305,21 +349,22 @@ def query(req: QueryRequest):
     answer = call_ollama(req.question, chunks)
     t_generate_ms = int((time.time() - t_gen0) * 1000)
 
-    # 3) Evidence formatting
+    # 3) Evidence formatting + retrieved_meta 구성
     evidences: List[Evidence] = []
     retrieved_meta: List[Dict[str, Any]] = []
-    for idx, c in chunks:
+
+    # ✅ 버그 수정: enumerate 사용
+    for idx, c in enumerate(chunks, start=1):
         ev = Evidence(
-                doc_title=c.get("doc_title", "unknown"),
-                doc_group=c.get("doc_group", "unknown"),
-                section=c.get("section"),
-                page=c.get("page"),
-                score=float(c.get("score", 0.0)),
-                snippet=(c.get("content") or "")[:200],
-            )
+            doc_title=c.get("doc_title", "unknown"),
+            doc_group=c.get("doc_group", "unknown"),
+            section=c.get("section"),
+            page=c.get("page"),
+            score=float(c.get("score", 0.0)),
+            snippet=(c.get("content") or "")[:200],
+        )
         evidences.append(ev)
 
-        # DB에 저장할 meta (jsonb)
         retrieved_meta.append(
             {
                 "rank": idx,
@@ -332,22 +377,19 @@ def query(req: QueryRequest):
             }
         )
 
-    t_total_ms = int((time.time() - t0) * 1000)
-
-    # 4) LLMOps 로그 저장
-    PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v0")
+    # 4) LLMOps 로그 저장 (스키마 정합성 OK)
     insert_query_log(
         query_log_id=query_log_id,
         question=req.question,
         doc_group=req.doc_group,
         top_k=TOP_K,
         retrieved_meta=retrieved_meta,
-        model_name=OLLAMA_MODEL,
-        prompt_version=PROMPT_VERSION,
+        embed_model_name=os.getenv("EMBED_MODEL_NAME", "unknown"),
+        llm_model=OLLAMA_MODEL,
+        prompt_version=os.getenv("PROMPT_VERSION", "v0"),
         answer=answer,
-        t_retrieval_ms=t_retrieval_ms,
-        t_generate_ms=t_generate_ms,
-        t_total_ms=t_total_ms,
+        latency_ms=int((time.time() - t0) * 1000),
+        error=None,
     )
 
     REQ_LAT.labels(endpoint="/query").observe(time.time() - t0)

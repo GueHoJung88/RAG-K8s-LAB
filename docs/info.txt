@@ -12,6 +12,10 @@ kubectl create namespace genai
 kubectl get namespaces
 kubectl delete namespace genai
 
+kubectl apply -f k8s/00-namespace.yaml
+kubectl get ns | egrep 'genai|monitoring'
+
+
 # Create/Apply (YAML 설정 적용)
 kubectl apply -n genai -f k8s/00-namespace.yaml
 kubectl apply -n genai -f k8s/10-postgres-pgvector.yaml
